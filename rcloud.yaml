@@ -1,0 +1,11 @@
+name: vm-health_monitor
+version: "1.0v"
+framework: langgraph
+
+llm:
+  provider: relusys
+  model: qwen3:8b
+
+deploy:
+  env: staging
+  tag: latest

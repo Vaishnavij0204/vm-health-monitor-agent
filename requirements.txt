@@ -1,0 +1,7 @@
+fastapi
+uvicorn[standard]
+langgraph
+httpx
+python-dotenv
+pydantic
+psutil

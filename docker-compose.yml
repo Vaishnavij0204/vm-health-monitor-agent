@@ -1,0 +1,16 @@
+services:
+  agent:
+    build: .
+    container_name: vm-health_monitor-staging
+    ports:
+      - "${HOST_PORT:-8000}:8000"
+    env_file:
+      - .env
+    environment:
+      - HOST=0.0.0.0
+      - PORT=8000
+      - LOG_FILE_PATH=postgresql.log
+    volumes:
+      - /:hostfs:ro
+      #- ./postgresql.log:/app/postgresql.log
+    restart: unless-stopped
