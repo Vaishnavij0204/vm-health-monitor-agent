@@ -1,32 +1,42 @@
 import os
 import logging
-from typing import Optional
 import httpx
+import socket
+import time
 from langchain_core.tools import tool
-from langchain_openai import ChatOpenAI
+
+LOGGER = logging.getLogger("agent")
+
+PROMETHEUS_URL = os.getenv("PROMETHEUS_URL", "http://192.168.0.117:9090")
 
 
+# Read instance names from .env
+NODE_INSTANCE = os.getenv("NODE_INSTANCE", "postgres-1:9100")
+POSTGRES_EXPORTER_INSTANCE = os.getenv("POSTGRES_EXPORTER_INSTANCE", "postgres-exporter:9187")
 
-LOGGER = logging.getLogger("rcloud.agent")
+# For direct endpoint hits, extract IP from NODE_INSTANCE
+VM_HOST = NODE_INSTANCE.split(":")[0]  # "postgres-1" → won't work for URL
 
-def debug_tools_enabled() -> bool:
-    return os.getenv("DEBUG_TOOLS", "false").lower() == "true"
+# Better: hardcode IPs or read from .env
+NODE_EXPORTER_IP = "192.168.0.162"  # The actual VM IP
+POSTGRES_EXPORTER_IP = "192.168.0.162"
 
-def _debug(message: str) -> None:
-    if debug_tools_enabled():
-        LOGGER.info(f"🔍 [TOOL DEBUG]: {message}")
+NODE_EXPORTER_URL = f"http://{NODE_EXPORTER_IP}:9100/metrics"
+POSTGRES_EXPORTER_URL = f"http://{POSTGRES_EXPORTER_IP}:9187/metrics"
+
+
 
 def get_llm():
-    """Initializes the LLM with tool-calling support."""
+    """Initialize LLM with tool-calling support."""
     base_url = os.getenv("MODEL_SERVER_URL")
     api_key = os.getenv("MODEL_SERVER_TOKEN", "dummy-token")
-    model_name = os.getenv("MODEL_NAME", "qwen3.6:27b")
+    model_name = os.getenv("MODEL_NAME", "qwen3:14b")
     verify_ssl = os.getenv("MODEL_SERVER_VERIFY_SSL", "true").lower() == "true"
 
     if not base_url:
         raise ValueError("MODEL_SERVER_URL must be configured in environment")
 
-    LOGGER.info(f"Initializing {model_name} at {base_url}")
+    from langchain_openai import ChatOpenAI
 
     custom_headers = {
         "Authorization": f"Bearer {api_key}",
@@ -51,27 +61,41 @@ def get_llm():
         http_client=http_client
     )
 
-@tool
-def get_postgres1_node_metrics() -> dict:
-    """Fetches comprehensive system metrics from postgres-1 node exporter endpoint."""
-    _debug("Querying postgres-1 node exporter at 192.168.0.162:9100/metrics")
-
+def query_prometheus(query: str) -> dict:
+    """Execute a PromQL query against Prometheus."""
     try:
-        with httpx.Client(timeout=10.0, verify=False) as client:
-            response = client.get("http://192.168.0.162:9100/metrics")
+        with httpx.Client(verify=False) as client:
+            response = client.get(
+                f"{PROMETHEUS_URL}/api/v1/query",
+                params={"query": query},
+                timeout=10.0
+            )
             if response.status_code != 200:
-                return {"error": f"Failed to fetch metrics: {response.status_code}"}
+                return {"error": f"Prometheus query failed: {response.status_code}"}
 
-            metrics_text = response.text
-            metrics = parse_node_exporter_metrics(metrics_text)
-            return metrics
+            data = response.json()
+            if data.get("status") != "success":
+                return {"error": f"Query error: {data.get('error', 'Unknown')}"}
+
+            return data.get("data", {})
     except Exception as e:
         return {"error": str(e)}
 
-def parse_node_exporter_metrics(metrics_text: str) -> dict:
-    """Comprehensive parsing of all node exporter metrics with fixes for memory and load."""
-    lines = metrics_text.split('\n')
+def fetch_metrics_endpoint(url: str) -> str:
+    """Fetch raw Prometheus metrics from an endpoint."""
+    try:
+        with httpx.Client(verify=False, timeout=10.0) as client:
+            response = client.get(url)
+            if response.status_code != 200:
+                return f"Error: Failed to fetch metrics from {url}"
+            return response.text
+    except Exception as e:
+        return f"Error: {str(e)}"
+
+def parse_prometheus_metrics(metrics_text: str, metric_names: list = None) -> dict:
+    """Parse Prometheus text format metrics, optionally filtering by names."""
     parsed = {}
+    lines = metrics_text.split('\n')
 
     for line in lines:
         if line.startswith('#') or not line.strip():
@@ -81,473 +105,272 @@ def parse_node_exporter_metrics(metrics_text: str) -> dict:
             if '{' in line:
                 metric_name = line.split('{')[0]
                 value = float(line.split()[-1])
+                labels = {}
+                # Extract labels
+                label_str = line.split('{')[1].split('}')[0]
+                for pair in label_str.split(','):
+                    key, val = pair.split('=')
+                    labels[key.strip()] = val.strip('"')
             else:
                 parts = line.split()
                 if len(parts) < 2:
                     continue
                 metric_name = parts[0]
                 value = float(parts[1])
+                labels = {}
 
-            # ===== CPU METRICS =====
-            if 'node_cpu_seconds_total' in metric_name:
-                if 'cpu_modes' not in parsed:
-                    parsed['cpu_modes'] = {}
-                for mode in ['user', 'system', 'idle', 'iowait', 'irq', 'softirq', 'steal', 'nice']:
-                    if mode in line:
-                        if mode not in parsed['cpu_modes']:
-                            parsed['cpu_modes'][mode] = []
-                        parsed['cpu_modes'][mode].append(value)
+            # Filter by metric names if specified
+            if metric_names and not any(name in metric_name for name in metric_names):
+                continue
 
-            # ===== MEMORY METRICS (FIX) =====
-            elif metric_name == 'node_memory_MemTotal_bytes':
-                parsed['memory_total_bytes'] = value
-            elif metric_name == 'node_memory_MemFree_bytes':
-                parsed['memory_free_bytes'] = value
-            elif metric_name == 'node_memory_MemAvailable_bytes':
-                parsed['memory_available_bytes'] = value
-            elif metric_name == 'node_memory_Buffers_bytes':
-                parsed['memory_buffers_bytes'] = value
-            elif metric_name == 'node_memory_Cached_bytes':
-                parsed['memory_cached_bytes'] = value
-            elif metric_name == 'node_memory_Dirty_bytes':
-                parsed['memory_dirty_bytes'] = value
-            elif metric_name == 'node_memory_Slab_bytes':
-                parsed['memory_slab_bytes'] = value
-            elif 'node_memory_Swap' in metric_name:
-                if 'SwapTotal' in metric_name:
-                    parsed['swap_total_bytes'] = value
-                elif 'SwapFree' in metric_name:
-                    parsed['swap_free_bytes'] = value
-
-            # ===== DISK FILESYSTEM METRICS =====
-            elif 'node_filesystem_size_bytes' in metric_name and 'mountpoint="/"' in line:
-                parsed['disk_total_bytes'] = value
-            elif 'node_filesystem_avail_bytes' in metric_name and 'mountpoint="/"' in line:
-                parsed['disk_available_bytes'] = value
-            elif 'node_filesystem_files_free' in metric_name and 'mountpoint="/"' in line:
-                parsed['disk_inodes_free'] = value
-            elif 'node_filesystem_files' in metric_name and 'mountpoint="/"' in line and 'free' not in metric_name:
-                parsed['disk_inodes_total'] = value
-
-            # ===== DISK I/O METRICS =====
-            elif 'node_disk_io_time_seconds_total' in metric_name:
-                if 'disk_io_time' not in parsed:
-                    parsed['disk_io_time'] = {}
-                device = line.split('device="')[1].split('"')[0] if 'device=' in line else 'unknown'
-                parsed['disk_io_time'][device] = value
-            elif 'node_disk_reads_completed_total' in metric_name:
-                if 'disk_reads' not in parsed:
-                    parsed['disk_reads'] = {}
-                device = line.split('device="')[1].split('"')[0] if 'device=' in line else 'unknown'
-                parsed['disk_reads'][device] = value
-            elif 'node_disk_writes_completed_total' in metric_name:
-                if 'disk_writes' not in parsed:
-                    parsed['disk_writes'] = {}
-                device = line.split('device="')[1].split('"')[0] if 'device=' in line else 'unknown'
-                parsed['disk_writes'][device] = value
-            elif 'node_disk_read_bytes_total' in metric_name:
-                if 'disk_read_bytes' not in parsed:
-                    parsed['disk_read_bytes'] = {}
-                device = line.split('device="')[1].split('"')[0] if 'device=' in line else 'unknown'
-                parsed['disk_read_bytes'][device] = value
-            elif 'node_disk_written_bytes_total' in metric_name:
-                if 'disk_written_bytes' not in parsed:
-                    parsed['disk_written_bytes'] = {}
-                device = line.split('device="')[1].split('"')[0] if 'device=' in line else 'unknown'
-                parsed['disk_written_bytes'][device] = value
-
-            # ===== NETWORK METRICS =====
-            elif 'node_network_receive_bytes_total' in metric_name:
-                if 'device=' in line:
-                    device = line.split('device="')[1].split('"')[0]
-                    if 'network_interfaces' not in parsed:
-                        parsed['network_interfaces'] = {}
-                    if device not in parsed['network_interfaces']:
-                        parsed['network_interfaces'][device] = {}
-                    parsed['network_interfaces'][device]['receive_bytes'] = value
-
-            elif 'node_network_transmit_bytes_total' in metric_name:
-                if 'device=' in line:
-                    device = line.split('device="')[1].split('"')[0]
-                    if 'network_interfaces' not in parsed:
-                        parsed['network_interfaces'] = {}
-                    if device not in parsed['network_interfaces']:
-                        parsed['network_interfaces'][device] = {}
-                    parsed['network_interfaces'][device]['transmit_bytes'] = value
-
-            elif 'node_network_receive_errs_total' in metric_name:
-                if 'device=' in line:
-                    device = line.split('device="')[1].split('"')[0]
-                    if 'network_interfaces' not in parsed:
-                        parsed['network_interfaces'] = {}
-                    if device not in parsed['network_interfaces']:
-                        parsed['network_interfaces'][device] = {}
-                    parsed['network_interfaces'][device]['receive_errors'] = value
-            elif 'node_network_transmit_errs_total' in metric_name:
-                if 'device=' in line:
-                    device = line.split('device="')[1].split('"')[0]
-                    if 'network_interfaces' not in parsed:
-                        parsed['network_interfaces'] = {}
-                    if device not in parsed['network_interfaces']:
-                        parsed['network_interfaces'][device] = {}
-                    parsed['network_interfaces'][device]['transmit_errors'] = value
-            elif 'node_network_receive_drop_total' in metric_name:
-                if 'device=' in line:
-                    device = line.split('device="')[1].split('"')[0]
-                    if 'network_interfaces' not in parsed:
-                        parsed['network_interfaces'] = {}
-                    if device not in parsed['network_interfaces']:
-                        parsed['network_interfaces'][device] = {}
-                    parsed['network_interfaces'][device]['receive_dropped'] = value
-            elif 'node_network_transmit_drop_total' in metric_name:
-                if 'device=' in line:
-                    device = line.split('device="')[1].split('"')[0]
-                    if 'network_interfaces' not in parsed:
-                        parsed['network_interfaces'] = {}
-                    if device not in parsed['network_interfaces']:
-                        parsed['network_interfaces'][device] = {}
-                    parsed['network_interfaces'][device]['transmit_dropped'] = value
-            # ===== PROCESS METRICS =====
-            elif 'node_processes_running' in metric_name:
-                parsed['processes_running'] = int(value)
-            elif 'node_processes_blocked' in metric_name:
-                parsed['processes_blocked'] = int(value)
-
-            # ===== SYSTEM METRICS =====
-            elif 'node_boot_time_seconds' in metric_name:
-                parsed['boot_time_seconds'] = int(value)
-            elif 'node_context_switches_total' in metric_name:
-                parsed['context_switches'] = int(value)
-            elif 'node_intr_total' in metric_name:
-                parsed['interrupts_total'] = int(value)
-
-            # ===== LOAD METRICS (FIX) =====
-            elif metric_name == 'node_load1':
-                parsed['load_1min'] = value
-            elif metric_name == 'node_load5':
-                parsed['load_5min'] = value
-            elif metric_name == 'node_load15':
-                parsed['load_15min'] = value
-
-            # ===== FILE DESCRIPTOR METRICS =====
-            elif 'node_filefd_allocated' in metric_name:
-                parsed['filefd_allocated'] = int(value)
-            elif 'node_filefd_maximum' in metric_name:
-                parsed['filefd_maximum'] = int(value)
-
-            # ===== NETWORK CONNECTIONS =====
-            elif 'node_sockstat_TCP_inuse' in metric_name:
-                parsed['tcp_connections_inuse'] = int(value)
-            elif 'node_sockstat_TCP_tw' in metric_name:
-                parsed['tcp_connections_timewait'] = int(value)
-            elif 'node_sockstat_UDP_inuse' in metric_name:
-                parsed['udp_connections_inuse'] = int(value)
+            if metric_name not in parsed:
+                parsed[metric_name] = []
+            parsed[metric_name].append({"value": value, "labels": labels})
 
         except (ValueError, IndexError, KeyError):
             continue
 
-    # ===== CALCULATE DERIVED METRICS =====
+    return parsed
 
-    # CPU Usage %
-    cpu_usage = 0
-    cpu_modes = parsed.get('cpu_modes', {})
-    if cpu_modes:
-        idle_total = sum(cpu_modes.get('idle', [0]))
-        non_idle = sum(cpu_modes.get('user', [0])) + sum(cpu_modes.get('system', [0])) + \
-                   sum(cpu_modes.get('iowait', [0])) + sum(cpu_modes.get('irq', [0])) + \
-                   sum(cpu_modes.get('softirq', [0])) + sum(cpu_modes.get('steal', [0]))
-        total = idle_total + non_idle
-        if total > 0:
-            cpu_usage = (non_idle / total) * 100
+@tool
+def get_node_metrics() -> dict:
+    """Fetch comprehensive system metrics: CPU, memory, disk, load, network from Node Exporter."""
+    instance = f"{VM_HOST}:9100"
 
-    # Memory calculations - FIXED
-    mem_total = parsed.get('memory_total_bytes', 0)
-    mem_available = parsed.get('memory_available_bytes', 0)
-    mem_used = mem_total - mem_available if mem_total > 0 else 0
-    mem_percent = (mem_used / mem_total * 100) if mem_total > 0 else 0
-
-    mem_cached = parsed.get('memory_cached_bytes', 0)
-    mem_buffers = parsed.get('memory_buffers_bytes', 0)
-
-    # Swap calculations
-    swap_total = parsed.get('swap_total_bytes', 0)
-    swap_free = parsed.get('swap_free_bytes', 0)
-    swap_used = swap_total - swap_free if swap_total > 0 else 0
-    swap_percent = (swap_used / swap_total * 100) if swap_total > 0 else 0
-
-    # Disk calculations
-    disk_total = parsed.get('disk_total_bytes', 0)
-    disk_available = parsed.get('disk_available_bytes', 0)
-    disk_used = disk_total - disk_available if disk_total > 0 else 0
-    disk_percent = (disk_used / disk_total * 100) if disk_total > 0 else 0
-
-    disk_inodes_total = parsed.get('disk_inodes_total', 0)
-    disk_inodes_free = parsed.get('disk_inodes_free', 0)
-    disk_inodes_used = disk_inodes_total - disk_inodes_free if disk_inodes_total > 0 else 0
-    disk_inodes_percent = (disk_inodes_used / disk_inodes_total * 100) if disk_inodes_total > 0 else 0
-
-    # Uptime calculation
-    import time
-    boot_time = parsed.get('boot_time_seconds', 0)
-    uptime_seconds = int(time.time()) - boot_time if boot_time > 0 else 0
-    uptime_days = uptime_seconds / 86400
-    uptime_hours = (uptime_seconds % 86400) / 3600
-
-    # File descriptor usage
-    filefd_allocated = parsed.get('filefd_allocated', 0)
-    filefd_maximum = parsed.get('filefd_maximum', 1)
-    filefd_percent = (filefd_allocated / filefd_maximum * 100) if filefd_maximum > 0 else 0
-
-    return {
-        "server": "postgres-1 (192.168.0.162)",
-        "timestamp": time.time(),
-
-        # CPU Section
-        "cpu": {
-            "usage_percent": round(cpu_usage, 2),
-            "idle_percent": round(100 - cpu_usage, 2),
-        },
-
-        # Memory Section (SI units: GB = 1000^3)
-        "memory": {
-            "total_gb": round(mem_total / (1000**3), 2),
-            "used_gb": round(mem_used / (1000**3), 2),
-            "available_gb": round(mem_available / (1000**3), 2),
-            "cached_gb": round(mem_cached / (1000**3), 2),
-            "buffers_gb": round(mem_buffers / (1000**3), 2),
-            "used_percent": round(mem_percent, 2),  # Keep this last
-            "free_percent": round(100 - mem_percent, 2),
-        },
-
-        # Swap Section (SI units)
-        "swap": {
-            "total_gb": round(swap_total / (1000**3), 2),
-            "used_gb": round(swap_used / (1000**3), 2),
-            "free_gb": round(swap_free / (1000**3), 2),
-            "used_percent": round(swap_percent, 2) if swap_total > 0 else 0,
-        },
-
-        # Disk Section (SI units)
-        "disk": {
-            "total_gb": round(disk_total / (1000**3), 2),
-            "used_gb": round(disk_used / (1000**3), 2),
-            "available_gb": round(disk_available / (1000**3), 2),
-            "used_percent": round(disk_percent, 2),
-            "inodes_total": int(disk_inodes_total),
-            "inodes_used": int(disk_inodes_used),
-            "inodes_free": int(disk_inodes_free),
-            "inodes_used_percent": round(disk_inodes_percent, 2),
-        },
-
-        # Disk I/O Section (SI units)
-        "disk_io": {
-            "io_time": parsed.get('disk_io_time', {}),
-            "reads": parsed.get('disk_reads', {}),
-            "writes": parsed.get('disk_writes', {}),
-            "read_bytes_gb": {k: round(v / (1000**3), 2) for k, v in parsed.get('disk_read_bytes', {}).items()},
-            "written_bytes_gb": {k: round(v / (1000**3), 2) for k, v in parsed.get('disk_written_bytes', {}).items()},
-        },
-
-        # Network Section (SI units)
-        "network": {
-            "interfaces": {
-                iface: {
-                    "receive_gb": round(data.get('receive_bytes', 0) / (1000**3), 2),
-                    "transmit_gb": round(data.get('transmit_bytes', 0) / (1000**3), 2),
-                }
-                for iface, data in parsed.get('network_interfaces', {}).items()
-            },
-            "receive_errors": int(parsed.get('network_receive_errors', 0)),
-            "transmit_errors": int(parsed.get('network_transmit_errors', 0)),
-            "receive_dropped": int(parsed.get('network_receive_dropped', 0)),
-            "transmit_dropped": int(parsed.get('network_transmit_dropped', 0)),
-        },
-        
-        # Process Section
-        "processes": {
-            "running": parsed.get('processes_running', 0),
-            "blocked": parsed.get('processes_blocked', 0),
-        },
-
-        # System Section
-        "system": {
-            "uptime_days": round(uptime_days, 2),
-            "uptime_hours": round(uptime_hours, 2),
-            "context_switches": int(parsed.get('context_switches', 0)),
-            "interrupts": int(parsed.get('interrupts_total', 0)),
-        },
-
-        # Load Section
-        "load": {
-            "1min": round(parsed.get('load_1min', 0), 2),
-            "5min": round(parsed.get('load_5min', 0), 2),
-            "15min": round(parsed.get('load_15min', 0), 2),
-        },
-
-        # File Descriptors Section
-        "file_descriptors": {
-            "allocated": int(parsed.get('filefd_allocated', 0)),
-            "maximum": int(parsed.get('filefd_maximum', 0)),
-            "used_percent": round(filefd_percent, 2),
-        },
-
-        # Network Connections Section
-        "connections": {
-            "tcp_inuse": int(parsed.get('tcp_connections_inuse', 0)),
-            "tcp_timewait": int(parsed.get('tcp_connections_timewait', 0)),
-            "udp_inuse": int(parsed.get('udp_connections_inuse', 0)),
-        },
-        "summary": {
-            "memory_used_percent": round(mem_percent, 2),
-            "memory_used_gb": round(mem_used / (1000**3), 2),
-            "memory_total_gb": round(mem_total / (1000**3), 2),
-        },
+    # Try Prometheus first
+    queries = {
+        "cpu_usage": f'100 - (avg(rate(node_cpu_seconds_total{{mode="idle",instance="{instance}"}}[1m])) * 100)',
+        "memory_used_percent": f'(1 - (node_memory_MemAvailable_bytes{{instance="{instance}"}} / node_memory_MemTotal_bytes{{instance="{instance}"}}) ) * 100',
+        "memory_used_gb": f'(node_memory_MemTotal_bytes{{instance="{instance}"}} - node_memory_MemAvailable_bytes{{instance="{instance}"}}) / 1000000000',
+        "memory_total_gb": f'node_memory_MemTotal_bytes{{instance="{instance}"}} / 1000000000',
+        "disk_used_percent": f'(1 - (node_filesystem_avail_bytes{{instance="{instance}",mountpoint="/"}} / node_filesystem_size_bytes{{instance="{instance}",mountpoint="/"}})) * 100',
+        "disk_used_gb": f'(node_filesystem_size_bytes{{instance="{instance}",mountpoint="/"}} - node_filesystem_avail_bytes{{instance="{instance}",mountpoint="/"}}) / 1000000000',
+        "disk_total_gb": f'node_filesystem_size_bytes{{instance="{instance}",mountpoint="/"}} / 1000000000',
+        "load_1min": f'node_load1{{instance="{instance}"}}',
+        "load_5min": f'node_load5{{instance="{instance}"}}',
+        "load_15min": f'node_load15{{instance="{instance}"}}',
+        "network_receive_bytes_rate": f'rate(node_network_receive_bytes_total{{instance="{instance}",device!="lo"}}[1m])',
+        "network_transmit_bytes_rate": f'rate(node_network_transmit_bytes_total{{instance="{instance}",device!="lo"}}[1m])',
+        "uptime_days": f'(time() - node_boot_time_seconds{{instance="{instance}"}}) / 86400',
     }
 
+    results = {}
+    for metric_name, query in queries.items():
+        result = query_prometheus(query)
+        if "error" not in result:
+            values = result.get("result", [])
+            if values:
+                if metric_name.startswith("network"):
+                    # Network metrics have per-interface data
+                    results[metric_name] = {}
+                    for v in values:
+                        device = v.get("metric", {}).get("device", "unknown")
+                        val = float(v.get("value", [0, 0])[1])
+                        results[metric_name][device] = round(val / 1000000, 2)  # Convert to Mbps
+                else:
+                    value = float(values[0].get("value", [0, 0])[1])
+                    results[metric_name] = round(value, 2)
+        else:
+            # Fallback to direct Node Exporter endpoint
+            LOGGER.info(f"Prometheus query failed for {metric_name}, falling back to Node Exporter endpoint")
+            metrics_text = fetch_metrics_endpoint(NODE_EXPORTER_URL)
+            if "Error" not in metrics_text:
+                parsed = parse_prometheus_metrics(metrics_text)
+                results[f"{metric_name}_fallback"] = "Using direct endpoint"
 
+    return results
 
 @tool
-def get_postgres1_top_processes(limit: int = 5) -> str:
-    """Lists top CPU-consuming processes on postgres-1."""
-    _debug(f"Fetching top {limit} processes from postgres-1")
-
+def get_postgres_health() -> dict:
+    """Check if PostgreSQL is running and get version info."""
     try:
-        with httpx.Client(timeout=10.0, verify=False) as client:
-            # Query node exporter for process metrics
-            response = client.get("http://192.168.0.162:9100/metrics")
-            metrics_text = response.text
-
-            # Parse process metrics
-            processes = {}
-            for line in metrics_text.split('\n'):
-                if 'node_processes_' in line or 'ps_' in line:
-                    continue
-
-            # Fallback: return top processes from /proc parsing
-            return "Top processes on postgres-1:\n(Requires SSH access for detailed process info)\n\nYou can use: ps aux --sort=-%cpu | head -10"
-    except Exception as e:
-        return f"Error fetching process info: {str(e)}"
-
-
-@tool
-def check_postgres_health(host: str = "192.168.0.162", port: int = 5432) -> dict:
-    """Check if PostgreSQL database server is responding on port 5432."""
-    _debug(f"Checking PostgreSQL on {host}:{port}")
-    try:
-        import socket
+        # First check: is port 5432 open?
         sock = socket.socket(socket.AF_INET, socket.SOCK_STREAM)
         sock.settimeout(3)
-        result = sock.connect_ex((host, port))
+        result = sock.connect_ex((VM_HOST, 5432))
         sock.close()
 
-        if result == 0:
+        if result != 0:
             return {
-                "server": f"{host}:{port}",
-                "status": "ONLINE",
-                "service": "PostgreSQL",
-                "message": "PostgreSQL is accepting connections"
+                "postgres_status": "OFFLINE",
+                "port_5432_status": "NOT_RESPONDING",
+                "message": "No service responding on port 5432"
             }
-        else:
+
+        # Second check: query postgres exporter for actual version
+        try:
+            with httpx.Client(verify=False, timeout=5.0) as client:
+                response = client.get(POSTGRES_EXPORTER_URL)
+                metrics_text = response.text
+
+                # Look for postgres version metric
+                version = None
+                for line in metrics_text.split('\n'):
+                    if 'pg_version' in line and not line.startswith('#'):
+                        try:
+                            value = float(line.split()[-1])
+                            version = int(value)
+                            break
+                        except:
+                            pass
+
+                if version:
+                    return {
+                        "postgres_status": "ONLINE",
+                        "port_5432_status": "OPEN",
+                        "version": version,
+                        "message": f"PostgreSQL version {version} is accepting connections"
+                    }
+                else:
+                    return {
+                        "postgres_status": "UNKNOWN",
+                        "port_5432_status": "OPEN",
+                        "message": "Port 5432 is open but could not determine PostgreSQL version"
+                    }
+        except:
             return {
-                "server": f"{host}:{port}",
-                "status": "OFFLINE",
-                "service": "PostgreSQL",
-                "message": "PostgreSQL is not accepting connections on port 5432"
+                "postgres_status": "PORT_OPEN_BUT_UNKNOWN",
+                "port_5432_status": "OPEN",
+                "message": "Port 5432 is responding but PostgreSQL version could not be determined"
             }
+
     except Exception as e:
         return {
-            "server": f"{host}:{port}",
-            "status": "ERROR",
-            "service": "PostgreSQL",
-            "message": f"Connection error: {str(e)}"
+            "postgres_status": "ERROR",
+            "error": str(e)
         }
 
-@tool
-def check_postgres_exporter_health(host: str = "192.168.0.162", port: int = 9187) -> dict:
-    """Check if Postgres exporter (metrics collector) is running on port 9187."""
-    _debug(f"Checking Postgres exporter on {host}:{port}")
-    try:
-        import socket
-        sock = socket.socket(socket.AF_INET, socket.SOCK_STREAM)
-        sock.settimeout(3)
-        result = sock.connect_ex((host, port))
-        sock.close()
 
-        if result == 0:
-            return {
-                "server": f"{host}:{port}",
-                "status": "ONLINE",
-                "service": "Postgres Exporter",
-                "message": "Metrics exporter is running and accepting connections"
-            }
-        else:
-            return {
-                "server": f"{host}:{port}",
-                "status": "OFFLINE",
-                "service": "Postgres Exporter",
-                "message": "Metrics exporter is not responding on port 9187"
-            }
-    except Exception as e:
-        return {
-            "server": f"{host}:{port}",
-            "status": "ERROR",
-            "service": "Postgres Exporter",
-            "message": f"Connection error: {str(e)}"
-        }
-        
-        
 @tool
-def check_internal_service_endpoint(url: str) -> dict:
-    """Pings an internal service endpoint to check availability."""
-    _debug(f"Checking endpoint: {url}")
+def get_postgres_metrics() -> dict:
+    """Fetch PostgreSQL-specific metrics from Postgres Exporter at 192.168.0.162:9187."""
+    metrics_text = fetch_metrics_endpoint(POSTGRES_EXPORTER_URL)
+
+    if "Error" in metrics_text:
+        return {"error": metrics_text}
+
+    # Parse relevant postgres metrics
+    parsed = parse_prometheus_metrics(
+        metrics_text,
+        metric_names=[
+            "pg_stat_database",
+            "pg_connections",
+            "pg_replication",
+            "pg_wal",
+            "pg_cache"
+        ]
+    )
+
+    results = {}
+    for metric_name, values in parsed.items():
+        results[metric_name] = values[:5]  # Top 5 values
+
+    return {
+        "source": POSTGRES_EXPORTER_URL,
+        "metrics": results,
+        "total_metrics_found": len(parsed)
+    }
+
+@tool
+def get_top_processes(limit: int = 5) -> dict:
+    """Get top processes by resource usage."""
+    instance = f"{VM_HOST}:9100"
+
+    # Try Prometheus first
+    cpu_query = f'topk({limit}, rate(process_cpu_seconds_total{{instance="{instance}"}}[1m]) * 100)'
+    mem_query = f'topk({limit}, process_resident_memory_bytes{{instance="{instance}"}}) / 1000000'
+
+    cpu_result = query_prometheus(cpu_query)
+    mem_result = query_prometheus(mem_query)
+
+    top_cpu = []
+    if "result" in cpu_result:
+        for item in cpu_result["result"]:
+            labels = item.get("metric", {})
+            value = float(item.get("value", [0, 0])[1])
+            top_cpu.append({
+                "job": labels.get("job", "unknown"),
+                "cpu_percent": round(value, 2)
+            })
+
+    top_mem = []
+    if "result" in mem_result:
+        for item in mem_result["result"]:
+            labels = item.get("metric", {})
+            value = float(item.get("value", [0, 0])[1])
+            top_mem.append({
+                "job": labels.get("job", "unknown"),
+                "memory_mb": round(value, 2)
+            })
+
+    return {
+        "top_by_cpu": top_cpu[:limit],
+        "top_by_memory": top_mem[:limit],
+    }
+
+@tool
+def check_endpoint(url: str) -> dict:
+    """Check if a service endpoint is reachable."""
     try:
-        with httpx.Client(timeout=5.0, verify=False, follow_redirects=True) as client:
+        with httpx.Client(timeout=5.0, verify=False) as client:
             response = client.get(url)
-            is_online = response.status_code < 400  # Accept 2xx and 3xx
+            is_online = response.status_code < 400
             return {
                 "url": url,
                 "status_code": response.status_code,
                 "online": is_online,
-                "message": "Online" if is_online else "Offline or unreachable"
+                "message": "Online" if is_online else "Offline"
             }
-    except httpx.RequestError as exc:
-        return {"url": url, "online": False, "error": str(exc), "message": "Connection failed"}
+    except Exception as e:
+        return {"url": url, "online": False, "error": str(e)}
+
+@tool
+def get_disk_io_rate() -> dict:
+    """Get disk I/O rate from Prometheus."""
+    instance = f"{VM_HOST}:9100"
+
+    read_query = f'rate(node_disk_read_bytes_total{{instance="{instance}"}}[1m])'
+    write_query = f'rate(node_disk_written_bytes_total{{instance="{instance}"}}[1m])'
+
+    read_result = query_prometheus(read_query)
+    write_result = query_prometheus(write_query)
+
+    read_rates = {}
+    if "result" in read_result:
+        for item in read_result["result"]:
+            device = item.get("metric", {}).get("device", "unknown")
+            value = float(item.get("value", [0, 0])[1])
+            read_rates[device] = round(value / 1000000, 2)  # Convert to MB/s
+
+    write_rates = {}
+    if "result" in write_result:
+        for item in write_result["result"]:
+            device = item.get("metric", {}).get("device", "unknown")
+            value = float(item.get("value", [0, 0])[1])
+            write_rates[device] = round(value / 1000000, 2)
+
+    return {
+        "read_mb_per_sec": read_rates,
+        "write_mb_per_sec": write_rates,
+    }
 
 @tool
 def get_memory_usage() -> dict:
-    """Get only memory usage percentage. Simple and clear for the agent."""
-    _debug("Fetching memory usage percentage")
+    """Get current memory usage percentage."""
+    instance = f"{VM_HOST}:9100"
 
-    try:
-        with httpx.Client(timeout=10.0, verify=False) as client:
-            response = client.get("http://192.168.0.162:9100/metrics")
-            metrics_text = response.text
+    query = f'(1 - (node_memory_MemAvailable_bytes{{instance="{instance}"}} / node_memory_MemTotal_bytes{{instance="{instance}"}}) ) * 100'
+    result = query_prometheus(query)
 
-            mem_total = 0
-            mem_available = 0
+    if "error" in result:
+        return {"error": result["error"]}
 
-            for line in metrics_text.split('\n'):
-                if line.startswith('#') or not line.strip():
-                    continue
-                if 'node_memory_MemTotal_bytes' in line and '{' not in line:
-                    mem_total = float(line.split()[-1])
-                elif 'node_memory_MemAvailable_bytes' in line and '{' not in line:
-                    mem_available = float(line.split()[-1])
-
-            if mem_total > 0:
-                used = mem_total - mem_available
-                used_percent = (used / mem_total) * 100
-                return {
-                    "memory_used_percent": round(used_percent, 2),
-                    "message": f"Memory usage is {round(used_percent, 2)}% of {round(mem_total / (1000**3), 2)} GB total"
-                }
-            else:
-                return {"error": "Could not fetch memory metrics"}
-    except Exception as e:
-        return {"error": str(e)}
-
-
-def get_tools() -> list:
-    return [get_postgres1_node_metrics, get_postgres1_top_processes,
-            check_internal_service_endpoint, check_postgres_health,
-            check_postgres_exporter_health, get_memory_usage]
+    values = result.get("result", [])
+    if values:
+        memory_used_percent = float(values[0].get("value", [0, 0])[1])
+        return {
+            "memory_used_percent": round(memory_used_percent, 2),
+            "message": f"Memory usage is {round(memory_used_percent, 2)}%"
+        }
+    else:
+        return {"error": "No data returned"}

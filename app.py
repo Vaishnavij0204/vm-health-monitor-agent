@@ -1,272 +1,159 @@
 
 import os
 import logging
+import json
+import re
 from typing import Annotated, Sequence
 from typing_extensions import TypedDict
 
 from dotenv import load_dotenv
-from langchain_core.messages import BaseMessage, HumanMessage, SystemMessage, AIMessage, ToolMessage
+from langchain_core.messages import BaseMessage, HumanMessage, SystemMessage, AIMessage
 from langgraph.graph import END, StateGraph, START
+from langgraph.prebuilt import ToolNode
 
 from tools import (
     get_llm,
+    get_node_metrics,
+    get_postgres_health,
+    get_top_processes,
+    check_endpoint,
+    get_disk_io_rate,
     get_memory_usage,
-    get_postgres1_node_metrics,
-    get_postgres1_top_processes,
-    check_internal_service_endpoint,
-    check_postgres_health,
-    check_postgres_exporter_health
+    get_postgres_metrics,
 )
 
-
 load_dotenv()
-LOGGER = logging.getLogger("rcloud.agent")
+LOGGER = logging.getLogger("agent")
 
 class AgentState(TypedDict):
     messages: Annotated[Sequence[BaseMessage], lambda x, y: x + y]
 
-llm = get_llm()
+def parse_tool_calls_from_text(text: str) -> list:
+    """Extract tool calls from LLM text output in [TOOLS] ... [/TOOLS] format."""
+    tool_calls = []
 
-def estimate_tokens(text: str) -> int:
-    """Rough estimate: ~1 token per 4 characters"""
-    return max(1, len(text) // 4)
+    # Look for [TOOLS_TO_CALL] ... [/TOOLS_TO_CALL] blocks
+    match = re.search(r'\[TOOLS_TO_CALL\](.*?)\[/TOOLS_TO_CALL\]', text, re.DOTALL)
 
+    if match:
+        json_str = match.group(1).strip()
+        try:
+            data = json.loads(json_str)
+            tools = data.get("tools", [])
 
-def call_model(state: AgentState):
-    """Call Qwen with instructions to print command keywords."""
-    messages = state["messages"]
+            # Convert tool names to tool_call format
+            for tool_name in tools:
+                tool_calls.append({
+                    "name": tool_name,
+                    "args": {},
+                    "id": f"call_{len(tool_calls)}"
+                })
 
-    sys_message = SystemMessage(
-        content=(
-            "You are a postgres-1 (192.168.0.162) VM Health Monitoring Agent.\n"
-            "You ONLY monitor the postgres-1 server at 192.168.0.162.\n\n"
-            "To gather system information, print EXACTLY one of these command keywords on its own line:\n\n"
-            "1. GET_POSTGRES1_METRICS - For: CPU, memory, disk, network, load, connections, uptime, processes\n"
-            "2. GET_TOP_PROCESSES - For: top processes consuming resources\n"
-            "3. CHECK_ENDPOINT http://URL - For: HTTP services (web, APIs, etc)\n"
-            "4. CHECK_POSTGRES_HEALTH - For: checking if PostgreSQL database is running on 192.168.0.162:5432\n"
-            "5. CHECK_POSTGRES_EXPORTER - For: checking if postgres metrics exporter is running on 192.168.0.162:9187\n\n"
-            "6. GET_MEMORY_USAGE - For: memory usage percentage only (simple and clear)\n"
-            "ROUTING GUIDE:\n"
-            "- 'is postgres running?' → CHECK_POSTGRES_HEALTH\n"
-            "- 'is postgres exporter running?' → CHECK_POSTGRES_EXPORTER\n"
-            "- 'is prometheus running?' → CHECK_ENDPOINT http://192.168.0.117:9090\n"
-            "- Other servers → Say: 'I only monitor postgres-1. Specify the IP/endpoint.'\n\n"
-            "Answer ONLY what was asked, be brief."
-            "After receiving the tool output, answer ONLY what was asked. Be concise.\n"
-            "For memory: always report the 'used_percent' field, not 'used_gb'\n"
-            "When reporting memory: use the 'summary' section with 'memory_used_percent' field.\n"
-            "For memory usage question, report: 'Memory usage is X%' where X is from memory_used_percent.\n"
-        )
+            print(f"✅ Parsed tool calls: {[tc['name'] for tc in tool_calls]}")
+        except json.JSONDecodeError as e:
+            print(f"⚠️  Failed to parse tool calls JSON: {e}")
+
+    return tool_calls
+
+def build_agent():
+    """Build the ReAct agent with Qwen."""
+    llm = get_llm()
+    llm_with_tools = llm  # Qwen doesn't use bind_tools, we'll parse manually
+
+    tools = [
+        get_node_metrics,
+        get_postgres_health,
+        get_top_processes,
+        check_endpoint,
+        get_disk_io_rate,
+        get_memory_usage,
+        get_postgres_metrics,
+    ]
+
+    def agent_node(state: AgentState):
+        """LLM reasoning node — decides which tools to call."""
+        messages = state["messages"]
+
+        sys_message = SystemMessage(
+    content=(
+        "You are a postgres-1 (192.168.0.162) VM Health Monitoring Agent.\n"
+        "Available tools:\n"
+        "- get_node_metrics: CPU, memory, disk, load (call this ONCE per session)\n"
+        "- get_postgres_health: PostgreSQL status\n"
+        "- get_postgres_metrics: PostgreSQL details from exporter\n"
+        "- get_top_processes: Top CPU/memory consuming processes\n"
+        "- get_disk_io_rate: Disk read/write rates\n"
+        "- get_memory_usage: Memory percentage only\n"
+        "- check_endpoint: Service availability\n\n"
+        "RULE: Only call each tool ONCE. Don't repeat.\n\n"
+        "Output tool calls in this format:\n"
+        "[TOOLS_TO_CALL]\n"
+        '{"tools": ["tool1", "tool2"], "reasoning": "..."}\n'
+        "[/TOOLS_TO_CALL]\n\n"
+        "Strategy:\n"
+        "1. 'server healthy?' → get_node_metrics + get_postgres_health (BOTH TOGETHER)\n"
+        "2. 'cpu usage?' → get_node_metrics only\n"
+        "3. 'why slow?' → get_node_metrics + get_top_processes\n"
+        "4. 'disk high?' → get_node_metrics + get_disk_io_rate\n"
+        "5. After getting results, SYNTHESIZE and STOP (no more tools)\n\n"
+        "IMPORTANT: You have already called these tools if mentioned:\n"
+        "- Previous tool calls are in the conversation history\n"
+        "- Reuse those results, don't call again\n"
+        "- Only call NEW tools if you need different data\n\n"
+        "Be concise. Answer directly."
+        "IMPORTANT: When asked about a specific postgres version:\n"
+        "- get_postgres_health() returns the actual version detected\n"
+        "- If version doesn't match what was asked, say it explicitly:\n"
+        "  'PostgreSQL is running, but it's version X, not postgres-18'\n"
+        "- Do NOT assume a version without data\n"
     )
-
-    if not messages or not isinstance(messages[0], SystemMessage):
-        messages = [sys_message] + list(messages)
-
-    response = llm.invoke(messages)
-    return {"messages": [response]}
-
-
-def text_router(state: AgentState):
-    """Route based on text output from Qwen."""
-    last_message = state["messages"][-1]
-    text = last_message.content if last_message.content else ""
-
-    if "GET_POSTGRES1_METRICS" in text:
-        return "execute_metrics"
-    elif "GET_TOP_PROCESSES" in text:
-        return "execute_processes"
-    elif "CHECK_POSTGRES_HEALTH" in text:
-        return "execute_postgres_check"
-    elif "CHECK_POSTGRES_EXPORTER" in text:
-        return "execute_exporter_check"
-    elif "CHECK_ENDPOINT" in text:
-        return "execute_endpoint"
-    elif "GET_MEMORY_USAGE" in text:
-        return "execute_memory"
-
-    return END
-
-
-def run_metrics_tool(state: AgentState):
-    """Execute the metrics tool with visibility."""
-    tool_name = "get_postgres1_node_metrics"
-    print(f"\n🔧 Tool Called: {tool_name}")
-    print(f"📋 Purpose: Fetching comprehensive system metrics (CPU, memory, disk, network, load)")
-    print(f"⏳ Executing...\n")
-
-    LOGGER.info(f"🔧 Executing: {tool_name}")
-    result = get_postgres1_node_metrics.invoke({})
-
-    import time; time.sleep(2)
-
-    print(f"✅ Tool executed successfully\n")
-
-    tool_msg = ToolMessage(
-        content=f"Tool Output:\n{str(result)}",
-        name=tool_name,
-        tool_call_id="text_routing"
-    )
-    return {"messages": [tool_msg]}
-
-def run_processes_tool(state: AgentState):
-    """Execute the top processes tool with visibility."""
-    tool_name = "get_postgres1_top_processes"
-    print(f"\n🔧 Tool Called: {tool_name}")
-    print(f"📋 Purpose: Fetching top CPU consuming processes")
-    print(f"⏳ Executing...\n")
-
-    LOGGER.info(f"🔧 Executing: {tool_name}")
-    result = get_postgres1_top_processes.invoke({"limit": 5})
-
-    import time; time.sleep(2)
-
-    print(f"✅ Tool executed successfully\n")
-
-    tool_msg = ToolMessage(
-        content=f"Tool Output:\n{result}",
-        name=tool_name,
-        tool_call_id="text_routing"
-    )
-    return {"messages": [tool_msg]}
-
-def run_memory_tool(state: AgentState):
-    tool_name = "get_memory_usage"
-    print(f"\n🔧 Tool Called: {tool_name}")
-    print(f"⏳ Executing...\n")
-
-    result = get_memory_usage.invoke({})
-
-    import time; time.sleep(1)
-    print(f"✅ Tool executed successfully\n")
-
-    tool_msg = ToolMessage(
-        content=f"{result['message']}",
-        name=tool_name,
-        tool_call_id="text_routing"
-    )
-    return {"messages": [tool_msg]}
-
-
-def run_postgres_check(state: AgentState):
-    """Check if PostgreSQL is running."""
-    tool_name = "check_postgres_health"
-    print(f"\n🔧 Tool Called: {tool_name}")
-    print(f"🌐 Target: 192.168.0.162:5432")
-    print(f"⏳ Executing...\n")
-
-    LOGGER.info(f"🔧 Executing: {tool_name}")
-    result = check_postgres_health.invoke({})
-
-    import time; time.sleep(2)
-
-    status = "🟢 ONLINE" if result.get("status") == "ONLINE" else "🔴 OFFLINE"
-    print(f"✅ Tool executed successfully")
-    print(f"📊 Status: {status}\n")
-
-    tool_msg = ToolMessage(
-        content=f"Tool Output:\n{str(result)}",
-        name=tool_name,
-        tool_call_id="text_routing"
-    )
-    return {"messages": [tool_msg]}
-
-def run_exporter_check(state: AgentState):
-    """Check if Postgres exporter is running."""
-    tool_name = "check_postgres_exporter_health"
-    print(f"\n🔧 Tool Called: {tool_name}")
-    print(f"🌐 Target: 192.168.0.162:9187")
-    print(f"⏳ Executing...\n")
-
-    LOGGER.info(f"🔧 Executing: {tool_name}")
-    result = check_postgres_exporter_health.invoke({})
-
-    import time; time.sleep(2)
-
-    status = "🟢 ONLINE" if result.get("status") == "ONLINE" else "🔴 OFFLINE"
-    print(f"✅ Tool executed successfully")
-    print(f"📊 Status: {status}\n")
-
-    tool_msg = ToolMessage(
-        content=f"Tool Output:\n{str(result)}",
-        name=tool_name,
-        tool_call_id="text_routing"
-    )
-    return {"messages": [tool_msg]}
-
-
-def run_endpoint_tool(state: AgentState):
-    """Execute the endpoint check tool with visibility."""
-    last_message = state["messages"][-1]
-    text = last_message.content
-
-    url = None
-    for line in text.split('\n'):
-        if 'http' in line.lower():
-            url = line.split()[-1]
-            break
-
-    if not url:
-        url = "http://192.168.0.162:9100"
-
-    tool_name = "check_internal_service_endpoint"
-    print(f"\n🔧 Tool Called: {tool_name}")
-    print(f"🌐 Target: {url}")
-    print(f"⏳ Executing...\n")
-
-    LOGGER.info(f"🔧 Executing: {tool_name} for {url}")
-    result = check_internal_service_endpoint.invoke({"url": url})
-
-    import time; time.sleep(2)
-
-    print(f"✅ Tool executed successfully\n")
-
-    tool_msg = ToolMessage(
-        content=f"Tool Output:\n{str(result)}",
-        name=tool_name,
-        tool_call_id="text_routing"
-    )
-    return {"messages": [tool_msg]}
-
-# Build graph
-workflow = StateGraph(AgentState)
-
-workflow.add_node("agent", call_model)
-workflow.add_node("execute_metrics", run_metrics_tool)
-workflow.add_node("execute_processes", run_processes_tool)
-workflow.add_node("execute_endpoint", run_endpoint_tool)
-workflow.add_node("execute_postgres_check", run_postgres_check)
-workflow.add_node("execute_exporter_check", run_exporter_check)
-workflow.add_node("execute_memory", run_memory_tool)
-workflow.add_edge("execute_memory", "agent")
-
-workflow.add_edge(START, "agent")
-
-workflow.add_conditional_edges(
-    "agent",
-    text_router,
-    {
-        "execute_metrics": "execute_metrics",
-        "execute_processes": "execute_processes",
-        "execute_endpoint": "execute_endpoint",
-        "execute_postgres_check": "execute_postgres_check",
-        "execute_exporter_check": "execute_exporter_check",
-        "execute_memory": "execute_memory",
-        END: END
-    }
 )
 
-workflow.add_edge("execute_metrics", "agent")
-workflow.add_edge("execute_processes", "agent")
-workflow.add_edge("execute_endpoint", "agent")
-workflow.add_edge("execute_postgres_check", "agent")
-workflow.add_edge("execute_exporter_check", "agent")
-workflow.add_edge("execute_memory", "agent")
+        if not messages or not isinstance(messages[0], SystemMessage):
+            messages = [sys_message] + list(messages)
 
-app = workflow.compile()
+        response = llm_with_tools.invoke(messages)
+        text = response.content
 
-def invoke_agent(user_query: str, history: list = None, *args, **kwargs):
-    """Invoke the agent with conversation history and token counting."""
+        # Parse tool calls from text
+        tool_calls = parse_tool_calls_from_text(text)
+
+        # Attach parsed tool calls to response
+        response.tool_calls = tool_calls
+
+        print(f"📝 LLM Output: {text[:150]}...")
+        print(f"🔧 Tool calls extracted: {[tc['name'] for tc in tool_calls]}")
+
+        return {"messages": [response]}
+
+    def should_continue(state: AgentState):
+        """Check if LLM has more tool calls to make."""
+        last_message = state["messages"][-1]
+
+        if hasattr(last_message, "tool_calls") and last_message.tool_calls:
+            print(f"📞 Executing tools: {[tc['name'] for tc in last_message.tool_calls]}")
+            return "tools"
+
+        print("✅ Agent finished (no more tools)")
+        return END
+
+    workflow = StateGraph(AgentState)
+    workflow.add_node("agent", agent_node)
+    workflow.add_node("tools", ToolNode(tools))
+
+    workflow.add_edge(START, "agent")
+    workflow.add_conditional_edges("agent", should_continue, {
+        "tools": "tools",
+        END: END
+    })
+    workflow.add_edge("tools", "agent")
+
+    return workflow.compile()
+
+app = build_agent()
+
+def invoke_agent(user_query: str, history: list = None):
+    """Invoke the agent with conversation history."""
     if history is None:
         history = []
 
@@ -285,18 +172,31 @@ def invoke_agent(user_query: str, history: list = None, *args, **kwargs):
 
     final_output = app.invoke({"messages": messages})
 
+    # Extract final response (filter out tool calls markers)
     last_message = final_output["messages"][-1]
     response_text = last_message.content
 
-    # Calculate total tokens
-    all_text = user_query + response_text + str([m.content for m in messages if hasattr(m, 'content')])
-    total_tokens = estimate_tokens(all_text)
+    # Clean up tool call markers from final response
+    response_text = re.sub(r'\[TOOLS_TO_CALL\].*?\[/TOOLS_TO_CALL\]', '', response_text, flags=re.DOTALL)
+    response_text = response_text.strip()
 
-    #print(f"\n🤖 Agent: {response_text}")
-    
-    print(f"\n💾 Total tokens: ~{total_tokens}\n")
+    #print(f"\n🤖 Agent: {response_text}\n")
 
     history.append({"role": "user", "content": user_query})
     history.append({"role": "assistant", "content": response_text})
 
     return response_text, history
+
+if __name__ == "__main__":
+    history = []
+    print("Health Monitor Agent (type 'exit' to quit)")
+    print("Try: 'Is the server healthy?', 'Check disk usage', etc.\n")
+
+    while True:
+        user_input = input("You: ").strip()
+        if user_input.lower() == "exit":
+            break
+        if not user_input:
+            continue
+
+        response, history = invoke_agent(user_input, history)
