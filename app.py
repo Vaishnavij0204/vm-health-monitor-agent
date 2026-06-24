@@ -15,12 +15,14 @@ from tools import (
     get_llm,
     get_node_metrics,
     get_postgres_health,
+    get_postgres_connections,  # ← ADD THIS LINE
     get_top_processes,
     check_endpoint,
     get_disk_io_rate,
     get_memory_usage,
     get_postgres_metrics,
 )
+
 
 load_dotenv()
 LOGGER = logging.getLogger("agent")
@@ -61,14 +63,15 @@ def build_agent():
     llm_with_tools = llm  # Qwen doesn't use bind_tools, we'll parse manually
 
     tools = [
-        get_node_metrics,
-        get_postgres_health,
-        get_top_processes,
-        check_endpoint,
-        get_disk_io_rate,
-        get_memory_usage,
-        get_postgres_metrics,
-    ]
+    get_node_metrics,
+    get_postgres_health,
+    get_postgres_connections,
+    get_top_processes,
+    check_endpoint,
+    get_disk_io_rate,
+    get_memory_usage,
+    get_postgres_metrics,
+]
 
     def agent_node(state: AgentState):
         """LLM reasoning node — decides which tools to call."""
@@ -106,6 +109,7 @@ def build_agent():
         "- If version doesn't match what was asked, say it explicitly:\n"
         "  'PostgreSQL is running, but it's version X, not postgres-18'\n"
         "- Do NOT assume a version without data\n"
+        "When asked about 'active connections', ALWAYS use get_postgres_connections.\n"
     )
 )
 

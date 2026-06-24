@@ -240,6 +240,45 @@ def get_postgres_health() -> dict:
             "error": str(e)
         }
 
+@tool
+def get_postgres_connections() -> dict:
+    """Get PostgreSQL connection metrics from Prometheus (exporter data)."""
+    try:
+        # Query Prometheus for total active connections across all databases
+        active_query = 'sum(pg_stat_activity_count{state="active"})'
+        idle_query = 'sum(pg_stat_activity_count{state="idle"})'
+        max_query = 'pg_settings_max_connections'
+
+        active_result = query_prometheus(active_query)
+        idle_result = query_prometheus(idle_query)
+        max_result = query_prometheus(max_query)
+
+        active = 0
+        idle = 0
+        max_conn = 100
+
+        # Extract values from Prometheus results
+        if "result" in active_result and active_result["result"]:
+            active = int(float(active_result["result"][0].get("value", [0, 0])[1]))
+
+        if "result" in idle_result and idle_result["result"]:
+            idle = int(float(idle_result["result"][0].get("value", [0, 0])[1]))
+
+        if "result" in max_result and max_result["result"]:
+            max_conn = int(float(max_result["result"][0].get("value", [0, 0])[1]))
+
+        total = active + idle
+        usage_percent = round((total / max_conn * 100), 2) if max_conn > 0 else 0
+
+        return {
+            "active_connections": active,
+            "idle_connections": idle,
+            "total_connections": total,
+            "max_connections": max_conn,
+            "usage_percent": usage_percent,
+        }
+    except Exception as e:
+        return {"error": f"Failed to query connection metrics: {str(e)}"}
 
 @tool
 def get_postgres_metrics() -> dict:
@@ -374,3 +413,8 @@ def get_memory_usage() -> dict:
         }
     else:
         return {"error": "No data returned"}
+    
+if __name__ == "__main__":
+    result = get_postgres_connections()
+    print("get_postgres_connections() returned:")
+    print(result)
