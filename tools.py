@@ -3,27 +3,27 @@ import logging
 import httpx
 import socket
 import time
+from datetime import datetime, timedelta
 from langchain_core.tools import tool
+from langchain_openai import ChatOpenAI
 
 LOGGER = logging.getLogger("agent")
 
+# Configuration
 PROMETHEUS_URL = os.getenv("PROMETHEUS_URL", "http://192.168.0.117:9090")
+NODE_EXPORTER_URL = os.getenv("NODE_EXPORTER_URL", "http://192.168.0.162:9100/metrics")
+POSTGRES_EXPORTER_URL = os.getenv("POSTGRES_EXPORTER_URL", "http://192.168.0.162:9187/metrics")
+VM_HOST = os.getenv("VM_HOST", "192.168.0.162")
+DEBUG_TOOLS = os.getenv("DEBUG_TOOLS", "true").lower() == "true"
 
 
-# Read instance names from .env
-NODE_INSTANCE = os.getenv("NODE_INSTANCE", "postgres-1:9100")
-POSTGRES_EXPORTER_INSTANCE = os.getenv("POSTGRES_EXPORTER_INSTANCE", "postgres-exporter:9187")
+def debug_tools_enabled() -> bool:
+    return DEBUG_TOOLS
 
-# For direct endpoint hits, extract IP from NODE_INSTANCE
-VM_HOST = NODE_INSTANCE.split(":")[0]  # "postgres-1" → won't work for URL
 
-# Better: hardcode IPs or read from .env
-NODE_EXPORTER_IP = "192.168.0.162"  # The actual VM IP
-POSTGRES_EXPORTER_IP = "192.168.0.162"
-
-NODE_EXPORTER_URL = f"http://{NODE_EXPORTER_IP}:9100/metrics"
-POSTGRES_EXPORTER_URL = f"http://{POSTGRES_EXPORTER_IP}:9187/metrics"
-
+def _debug(message: str) -> None:
+    if debug_tools_enabled():
+        LOGGER.info(f"🔍 [TOOL DEBUG]: {message}")
 
 
 def get_llm():
@@ -32,21 +32,17 @@ def get_llm():
     api_key = os.getenv("MODEL_SERVER_TOKEN", "dummy-token")
     model_name = os.getenv("MODEL_NAME", "qwen3:14b")
     verify_ssl = os.getenv("MODEL_SERVER_VERIFY_SSL", "true").lower() == "true"
+    
 
     if not base_url:
         raise ValueError("MODEL_SERVER_URL must be configured in environment")
-
-    from langchain_openai import ChatOpenAI
 
     custom_headers = {
         "Authorization": f"Bearer {api_key}",
         "X-API-Key": api_key,
     }
 
-    http_client = httpx.Client(
-        verify=verify_ssl,
-        headers=custom_headers
-    )
+    http_client = httpx.Client(verify=verify_ssl, headers=custom_headers)
 
     if not verify_ssl:
         import urllib3
@@ -61,15 +57,26 @@ def get_llm():
         http_client=http_client
     )
 
-def query_prometheus(query: str) -> dict:
-    """Execute a PromQL query against Prometheus."""
+
+def query_prometheus(query: str, start: int = None, end: int = None, step: str = "60s") -> dict:
+    """Execute a PromQL query. Can be instant or range query."""
+    _debug(f"Querying Prometheus: {query[:50]}...")
     try:
         with httpx.Client(verify=False) as client:
-            response = client.get(
-                f"{PROMETHEUS_URL}/api/v1/query",
-                params={"query": query},
-                timeout=10.0
-            )
+            # Range query if start/end provided, otherwise instant query
+            if start and end:
+                response = client.get(
+                    f"{PROMETHEUS_URL}/api/v1/query_range",
+                    params={"query": query, "start": start, "end": end, "step": step},
+                    timeout=15.0
+                )
+            else:
+                response = client.get(
+                    f"{PROMETHEUS_URL}/api/v1/query",
+                    params={"query": query},
+                    timeout=10.0
+                )
+
             if response.status_code != 200:
                 return {"error": f"Prometheus query failed: {response.status_code}"}
 
@@ -79,21 +86,25 @@ def query_prometheus(query: str) -> dict:
 
             return data.get("data", {})
     except Exception as e:
+        _debug(f"Prometheus query failed: {str(e)}")
         return {"error": str(e)}
+
 
 def fetch_metrics_endpoint(url: str) -> str:
     """Fetch raw Prometheus metrics from an endpoint."""
+    _debug(f"Fetching metrics from {url}")
     try:
         with httpx.Client(verify=False, timeout=10.0) as client:
             response = client.get(url)
             if response.status_code != 200:
-                return f"Error: Failed to fetch metrics from {url}"
+                return f"Error: Failed to fetch metrics (status {response.status_code})"
             return response.text
     except Exception as e:
         return f"Error: {str(e)}"
 
+
 def parse_prometheus_metrics(metrics_text: str, metric_names: list = None) -> dict:
-    """Parse Prometheus text format metrics, optionally filtering by names."""
+    """Parse Prometheus text format metrics."""
     parsed = {}
     lines = metrics_text.split('\n')
 
@@ -106,7 +117,6 @@ def parse_prometheus_metrics(metrics_text: str, metric_names: list = None) -> di
                 metric_name = line.split('{')[0]
                 value = float(line.split()[-1])
                 labels = {}
-                # Extract labels
                 label_str = line.split('{')[1].split('}')[0]
                 for pair in label_str.split(','):
                     key, val = pair.split('=')
@@ -119,7 +129,6 @@ def parse_prometheus_metrics(metrics_text: str, metric_names: list = None) -> di
                 value = float(parts[1])
                 labels = {}
 
-            # Filter by metric names if specified
             if metric_names and not any(name in metric_name for name in metric_names):
                 continue
 
@@ -132,106 +141,86 @@ def parse_prometheus_metrics(metrics_text: str, metric_names: list = None) -> di
 
     return parsed
 
+
+# ============================================================================
+# CORE MONITORING TOOLS
+# ============================================================================
+
 @tool
 def get_node_metrics() -> dict:
-    """Fetch comprehensive system metrics: CPU, memory, disk, load, network from Node Exporter."""
-    instance = f"{VM_HOST}:9100"
+    """Fetch comprehensive system metrics: CPU, memory, disk, load, network."""
+    _debug("Fetching node metrics from Prometheus")
 
-    # Try Prometheus first
     queries = {
-        "cpu_usage": f'100 - (avg(rate(node_cpu_seconds_total{{mode="idle",instance="{instance}"}}[1m])) * 100)',
-        "memory_used_percent": f'(1 - (node_memory_MemAvailable_bytes{{instance="{instance}"}} / node_memory_MemTotal_bytes{{instance="{instance}"}}) ) * 100',
-        "memory_used_gb": f'(node_memory_MemTotal_bytes{{instance="{instance}"}} - node_memory_MemAvailable_bytes{{instance="{instance}"}}) / 1000000000',
-        "memory_total_gb": f'node_memory_MemTotal_bytes{{instance="{instance}"}} / 1000000000',
-        "disk_used_percent": f'(1 - (node_filesystem_avail_bytes{{instance="{instance}",mountpoint="/"}} / node_filesystem_size_bytes{{instance="{instance}",mountpoint="/"}})) * 100',
-        "disk_used_gb": f'(node_filesystem_size_bytes{{instance="{instance}",mountpoint="/"}} - node_filesystem_avail_bytes{{instance="{instance}",mountpoint="/"}}) / 1000000000',
-        "disk_total_gb": f'node_filesystem_size_bytes{{instance="{instance}",mountpoint="/"}} / 1000000000',
-        "load_1min": f'node_load1{{instance="{instance}"}}',
-        "load_5min": f'node_load5{{instance="{instance}"}}',
-        "load_15min": f'node_load15{{instance="{instance}"}}',
-        "network_receive_bytes_rate": f'rate(node_network_receive_bytes_total{{instance="{instance}",device!="lo"}}[1m])',
-        "network_transmit_bytes_rate": f'rate(node_network_transmit_bytes_total{{instance="{instance}",device!="lo"}}[1m])',
-        "uptime_days": f'(time() - node_boot_time_seconds{{instance="{instance}"}}) / 86400',
+        "cpu_usage": '100 - (avg(rate(node_cpu_seconds_total{mode="idle",job="node-postgres-1"}[1m])) * 100)',
+        "memory_used_percent": '(1 - (node_memory_MemAvailable_bytes{job="node-postgres-1"} / node_memory_MemTotal_bytes{job="node-postgres-1"})) * 100',
+        "memory_used_gb": '(node_memory_MemTotal_bytes{job="node-postgres-1"} - node_memory_MemAvailable_bytes{job="node-postgres-1"}) / 1000000000',
+        "memory_total_gb": 'node_memory_MemTotal_bytes{job="node-postgres-1"} / 1000000000',
+        "disk_used_percent": '(1 - (node_filesystem_avail_bytes{job="node-postgres-1",mountpoint="/"} / node_filesystem_size_bytes{job="node-postgres-1",mountpoint="/"})) * 100',
+        "disk_used_gb": '(node_filesystem_size_bytes{job="node-postgres-1",mountpoint="/"} - node_filesystem_avail_bytes{job="node-postgres-1",mountpoint="/"}) / 1000000000',
+        "disk_total_gb": 'node_filesystem_size_bytes{job="node-postgres-1",mountpoint="/"} / 1000000000',
+        "load_1min": 'node_load1{job="node-postgres-1"}',
+        "load_5min": 'node_load5{job="node-postgres-1"}',
+        "load_15min": 'node_load15{job="node-postgres-1"}',
+        "uptime_days": '(time() - node_boot_time_seconds{job="node-postgres-1"}) / 86400',
     }
 
     results = {}
     for metric_name, query in queries.items():
         result = query_prometheus(query)
-        if "error" not in result:
+        if "error" not in result and "result" in result:
             values = result.get("result", [])
             if values:
-                if metric_name.startswith("network"):
-                    # Network metrics have per-interface data
-                    results[metric_name] = {}
-                    for v in values:
-                        device = v.get("metric", {}).get("device", "unknown")
-                        val = float(v.get("value", [0, 0])[1])
-                        results[metric_name][device] = round(val / 1000000, 2)  # Convert to Mbps
-                else:
-                    value = float(values[0].get("value", [0, 0])[1])
-                    results[metric_name] = round(value, 2)
+                value = float(values[0].get("value", [0, 0])[1])
+                results[metric_name] = round(value, 2)
+            else:
+                results[metric_name] = 0
         else:
-            # Fallback to direct Node Exporter endpoint
-            LOGGER.info(f"Prometheus query failed for {metric_name}, falling back to Node Exporter endpoint")
-            metrics_text = fetch_metrics_endpoint(NODE_EXPORTER_URL)
-            if "Error" not in metrics_text:
-                parsed = parse_prometheus_metrics(metrics_text)
-                results[f"{metric_name}_fallback"] = "Using direct endpoint"
+            results[metric_name] = 0
 
-    return results
+    return {
+        "cpu_percent": results.get("cpu_usage", 0),
+        "memory": {
+            "used_percent": results.get("memory_used_percent", 0),
+            "used_gb": results.get("memory_used_gb", 0),
+            "total_gb": results.get("memory_total_gb", 0),
+        },
+        "disk": {
+            "used_percent": results.get("disk_used_percent", 0),
+            "used_gb": results.get("disk_used_gb", 0),
+            "total_gb": results.get("disk_total_gb", 0),
+        },
+        "load": {
+            "1min": results.get("load_1min", 0),
+            "5min": results.get("load_5min", 0),
+            "15min": results.get("load_15min", 0),
+        },
+        "uptime_days": results.get("uptime_days", 0),
+    }
+
 
 @tool
 def get_postgres_health() -> dict:
-    """Check if PostgreSQL is running and get version info."""
+    """Check if PostgreSQL is running and accepting connections."""
+    _debug("Checking PostgreSQL health")
+
     try:
-        # First check: is port 5432 open?
         sock = socket.socket(socket.AF_INET, socket.SOCK_STREAM)
         sock.settimeout(3)
         result = sock.connect_ex((VM_HOST, 5432))
         sock.close()
 
-        if result != 0:
+        if result == 0:
+            return {
+                "postgres_status": "ONLINE",
+                "port": 5432,
+                "message": "PostgreSQL is accepting connections"
+            }
+        else:
             return {
                 "postgres_status": "OFFLINE",
-                "port_5432_status": "NOT_RESPONDING",
-                "message": "No service responding on port 5432"
-            }
-
-        # Second check: query postgres exporter for actual version
-        try:
-            with httpx.Client(verify=False, timeout=5.0) as client:
-                response = client.get(POSTGRES_EXPORTER_URL)
-                metrics_text = response.text
-
-                # Look for postgres version metric
-                version = None
-                for line in metrics_text.split('\n'):
-                    if 'pg_version' in line and not line.startswith('#'):
-                        try:
-                            value = float(line.split()[-1])
-                            version = int(value)
-                            break
-                        except:
-                            pass
-
-                if version:
-                    return {
-                        "postgres_status": "ONLINE",
-                        "port_5432_status": "OPEN",
-                        "version": version,
-                        "message": f"PostgreSQL version {version} is accepting connections"
-                    }
-                else:
-                    return {
-                        "postgres_status": "UNKNOWN",
-                        "port_5432_status": "OPEN",
-                        "message": "Port 5432 is open but could not determine PostgreSQL version"
-                    }
-        except:
-            return {
-                "postgres_status": "PORT_OPEN_BUT_UNKNOWN",
-                "port_5432_status": "OPEN",
-                "message": "Port 5432 is responding but PostgreSQL version could not be determined"
+                "port": 5432,
+                "message": "PostgreSQL is not responding on port 5432"
             }
 
     except Exception as e:
@@ -240,33 +229,29 @@ def get_postgres_health() -> dict:
             "error": str(e)
         }
 
+
 @tool
 def get_postgres_connections() -> dict:
-    """Get PostgreSQL connection metrics from Prometheus (exporter data)."""
+    """Get PostgreSQL connection metrics."""
+    _debug("Fetching PostgreSQL connection metrics")
+
     try:
-        # Query Prometheus for total active connections across all databases
-        active_query = 'sum(pg_stat_activity_count{state="active"})'
-        idle_query = 'sum(pg_stat_activity_count{state="idle"})'
-        max_query = 'pg_settings_max_connections'
+        queries = {
+            "active": 'sum(pg_stat_activity_count{state="active"})',
+            "idle": 'sum(pg_stat_activity_count{state="idle"})',
+            "max": 'pg_settings_max_connections',
+        }
 
-        active_result = query_prometheus(active_query)
-        idle_result = query_prometheus(idle_query)
-        max_result = query_prometheus(max_query)
+        results = {}
+        for name, query in queries.items():
+            result = query_prometheus(query)
+            if "result" in result and result["result"]:
+                value = float(result["result"][0].get("value", [0, 0])[1])
+                results[name] = int(value)
 
-        active = 0
-        idle = 0
-        max_conn = 100
-
-        # Extract values from Prometheus results
-        if "result" in active_result and active_result["result"]:
-            active = int(float(active_result["result"][0].get("value", [0, 0])[1]))
-
-        if "result" in idle_result and idle_result["result"]:
-            idle = int(float(idle_result["result"][0].get("value", [0, 0])[1]))
-
-        if "result" in max_result and max_result["result"]:
-            max_conn = int(float(max_result["result"][0].get("value", [0, 0])[1]))
-
+        active = results.get("active", 0)
+        idle = results.get("idle", 0)
+        max_conn = results.get("max", 100)
         total = active + idle
         usage_percent = round((total / max_conn * 100), 2) if max_conn > 0 else 0
 
@@ -278,78 +263,15 @@ def get_postgres_connections() -> dict:
             "usage_percent": usage_percent,
         }
     except Exception as e:
+        _debug(f"Failed to get connections: {e}")
         return {"error": f"Failed to query connection metrics: {str(e)}"}
 
-@tool
-def get_postgres_metrics() -> dict:
-    """Fetch PostgreSQL-specific metrics from Postgres Exporter at 192.168.0.162:9187."""
-    metrics_text = fetch_metrics_endpoint(POSTGRES_EXPORTER_URL)
-
-    if "Error" in metrics_text:
-        return {"error": metrics_text}
-
-    # Parse relevant postgres metrics
-    parsed = parse_prometheus_metrics(
-        metrics_text,
-        metric_names=[
-            "pg_stat_database",
-            "pg_connections",
-            "pg_replication",
-            "pg_wal",
-            "pg_cache"
-        ]
-    )
-
-    results = {}
-    for metric_name, values in parsed.items():
-        results[metric_name] = values[:5]  # Top 5 values
-
-    return {
-        "source": POSTGRES_EXPORTER_URL,
-        "metrics": results,
-        "total_metrics_found": len(parsed)
-    }
-
-@tool
-def get_top_processes(limit: int = 5) -> dict:
-    """Get top processes by resource usage."""
-    instance = f"{VM_HOST}:9100"
-
-    # Try Prometheus first
-    cpu_query = f'topk({limit}, rate(process_cpu_seconds_total{{instance="{instance}"}}[1m]) * 100)'
-    mem_query = f'topk({limit}, process_resident_memory_bytes{{instance="{instance}"}}) / 1000000'
-
-    cpu_result = query_prometheus(cpu_query)
-    mem_result = query_prometheus(mem_query)
-
-    top_cpu = []
-    if "result" in cpu_result:
-        for item in cpu_result["result"]:
-            labels = item.get("metric", {})
-            value = float(item.get("value", [0, 0])[1])
-            top_cpu.append({
-                "job": labels.get("job", "unknown"),
-                "cpu_percent": round(value, 2)
-            })
-
-    top_mem = []
-    if "result" in mem_result:
-        for item in mem_result["result"]:
-            labels = item.get("metric", {})
-            value = float(item.get("value", [0, 0])[1])
-            top_mem.append({
-                "job": labels.get("job", "unknown"),
-                "memory_mb": round(value, 2)
-            })
-
-    return {
-        "top_by_cpu": top_cpu[:limit],
-        "top_by_memory": top_mem[:limit],
-    }
 
 @tool
 def check_endpoint(url: str) -> dict:
     """Check if a service endpoint is reachable."""
+    _debug(f"Checking endpoint: {url}")
+
     try:
         with httpx.Client(timeout=5.0, verify=False) as client:
             response = client.get(url)
@@ -361,60 +283,300 @@ def check_endpoint(url: str) -> dict:
                 "message": "Online" if is_online else "Offline"
             }
     except Exception as e:
-        return {"url": url, "online": False, "error": str(e)}
+        return {
+            "url": url,
+            "online": False,
+            "error": str(e),
+            "message": "Connection failed"
+        }
+
+
+# ============================================================================
+# FEATURE 1: HISTORICAL TRENDS
+# ============================================================================
 
 @tool
-def get_disk_io_rate() -> dict:
-    """Get disk I/O rate from Prometheus."""
-    instance = f"{VM_HOST}:9100"
+def get_metric_trends(metric: str = "cpu", hours: int = 1) -> dict:
+    """
+    Analyze historical trends for a metric over the past N hours.
 
-    read_query = f'rate(node_disk_read_bytes_total{{instance="{instance}"}}[1m])'
-    write_query = f'rate(node_disk_written_bytes_total{{instance="{instance}"}}[1m])'
+    Metrics: cpu, memory, disk, load
+    Hours: 1-24
 
-    read_result = query_prometheus(read_query)
-    write_result = query_prometheus(write_query)
+    Returns: min, max, avg, current, trend direction, rate of change
+    """
+    _debug(f"Analyzing {metric} trends for past {hours} hours")
 
-    read_rates = {}
-    if "result" in read_result:
-        for item in read_result["result"]:
-            device = item.get("metric", {}).get("device", "unknown")
-            value = float(item.get("value", [0, 0])[1])
-            read_rates[device] = round(value / 1000000, 2)  # Convert to MB/s
+    if hours < 1 or hours > 24:
+        return {"error": "Hours must be between 1 and 24"}
 
-    write_rates = {}
-    if "result" in write_result:
-        for item in write_result["result"]:
-            device = item.get("metric", {}).get("device", "unknown")
-            value = float(item.get("value", [0, 0])[1])
-            write_rates[device] = round(value / 1000000, 2)
+    now = int(time.time())
+    start = now - (hours * 3600)
 
-    return {
-        "read_mb_per_sec": read_rates,
-        "write_mb_per_sec": write_rates,
+    # Select query based on metric
+    metric_queries = {
+        "cpu": '100 - (avg(rate(node_cpu_seconds_total{mode="idle",job="node-postgres-1"}[1m])) * 100)',
+        "memory": '(1 - (node_memory_MemAvailable_bytes{job="node-postgres-1"} / node_memory_MemTotal_bytes{job="node-postgres-1"})) * 100',
+        "disk": '(1 - (node_filesystem_avail_bytes{job="node-postgres-1",mountpoint="/"} / node_filesystem_size_bytes{job="node-postgres-1",mountpoint="/"})) * 100',
+        "load": 'node_load1{job="node-postgres-1"}',
     }
 
-@tool
-def get_memory_usage() -> dict:
-    """Get current memory usage percentage."""
-    instance = f"{VM_HOST}:9100"
+    if metric not in metric_queries:
+        return {"error": f"Unknown metric: {metric}. Supported: cpu, memory, disk, load"}
 
-    query = f'(1 - (node_memory_MemAvailable_bytes{{instance="{instance}"}} / node_memory_MemTotal_bytes{{instance="{instance}"}}) ) * 100'
-    result = query_prometheus(query)
+    query = metric_queries[metric]
+    result = query_prometheus(query, start=start, end=now, step="60s")
 
-    if "error" in result:
-        return {"error": result["error"]}
+    if "error" in result or "result" not in result:
+        return {"error": "Failed to fetch historical data"}
 
-    values = result.get("result", [])
-    if values:
-        memory_used_percent = float(values[0].get("value", [0, 0])[1])
-        return {
-            "memory_used_percent": round(memory_used_percent, 2),
-            "message": f"Memory usage is {round(memory_used_percent, 2)}%"
-        }
+    # Extract values
+    series = result.get("result", [])
+    if not series or not series[0].get("values"):
+        return {"error": "No historical data available"}
+
+    values = [float(v[1]) for v in series[0]["values"]]
+
+    if not values:
+        return {"error": "No valid data points"}
+
+    # Calculate statistics
+    min_val = min(values)
+    max_val = max(values)
+    avg_val = sum(values) / len(values)
+    current_val = values[-1]
+
+    # Determine trend
+    if len(values) > 1:
+        first_half_avg = sum(values[:len(values)//2]) / (len(values)//2)
+        second_half_avg = sum(values[len(values)//2:]) / (len(values) - len(values)//2)
+        trend = "📈 Increasing" if second_half_avg > first_half_avg else "📉 Decreasing"
+        rate_of_change = round(((second_half_avg - first_half_avg) / first_half_avg * 100), 2) if first_half_avg > 0 else 0
     else:
-        return {"error": "No data returned"}
-    
+        trend = "➡️ Stable"
+        rate_of_change = 0
+
+    return {
+        "metric": metric,
+        "hours": hours,
+        "current_value": round(current_val, 2),
+        "min_value": round(min_val, 2),
+        "max_value": round(max_val, 2),
+        "avg_value": round(avg_val, 2),
+        "trend": trend,
+        "rate_of_change_percent": rate_of_change,
+        "data_points": len(values),
+    }
+
+
+# ============================================================================
+# FEATURE 2: SMART ANOMALY DETECTION
+# ============================================================================
+
+@tool
+def detect_anomalies() -> dict:
+    """
+    Detect unusual patterns in system metrics.
+
+    Uses statistical analysis to find:
+    - Sudden spikes or drops
+    - Abnormal values compared to baseline
+    - Unusual correlations between metrics
+    """
+    _debug("Running anomaly detection")
+
+    # Get current metrics
+    current = get_node_metrics()
+
+    # Get historical baseline (last 6 hours)
+    cpu_trend = get_metric_trends("cpu", hours=6)
+    mem_trend = get_metric_trends("memory", hours=6)
+    disk_trend = get_metric_trends("disk", hours=6)
+    load_trend = get_metric_trends("load", hours=6)
+
+    anomalies = []
+    severity_score = 0
+
+    # Check CPU anomalies
+    if not cpu_trend.get("error"):
+        cpu_current = current["cpu_percent"]
+        cpu_avg = cpu_trend.get("avg_value", 0)
+        cpu_max = cpu_trend.get("max_value", 0)
+
+        if cpu_current > cpu_avg + (cpu_avg * 0.5):  # 50% above average
+            anomalies.append({
+                "type": "CPU_SPIKE",
+                "severity": "HIGH" if cpu_current > 80 else "MEDIUM",
+                "current": cpu_current,
+                "baseline": cpu_avg,
+                "message": f"CPU usage ({cpu_current}%) is significantly higher than baseline ({cpu_avg}%)"
+            })
+            severity_score += 3 if cpu_current > 80 else 2
+
+    # Check memory anomalies
+    if not mem_trend.get("error"):
+        mem_current = current["memory"]["used_percent"]
+        mem_avg = mem_trend.get("avg_value", 0)
+
+        if mem_current > mem_avg + (mem_avg * 0.3):  # 30% above average
+            anomalies.append({
+                "type": "MEMORY_SPIKE",
+                "severity": "HIGH" if mem_current > 85 else "MEDIUM",
+                "current": mem_current,
+                "baseline": mem_avg,
+                "message": f"Memory usage ({mem_current}%) is abnormally high compared to baseline ({mem_avg}%)"
+            })
+            severity_score += 3 if mem_current > 85 else 2
+
+    # Check disk anomalies
+    if not disk_trend.get("error"):
+        disk_current = current["disk"]["used_percent"]
+        disk_max = disk_trend.get("max_value", 0)
+
+        if disk_current > 90:
+            anomalies.append({
+                "type": "DISK_CRITICAL",
+                "severity": "CRITICAL",
+                "current": disk_current,
+                "message": f"Disk usage ({disk_current}%) is critical. Immediate action needed."
+            })
+            severity_score += 5
+
+    # Check load anomalies
+    if not load_trend.get("error"):
+        load_current = current["load"]["1min"]
+        load_avg = load_trend.get("avg_value", 0)
+
+        if load_current > load_avg * 2:  # 2x the average
+            anomalies.append({
+                "type": "LOAD_SPIKE",
+                "severity": "HIGH",
+                "current": load_current,
+                "baseline": load_avg,
+                "message": f"System load ({load_current}) is 2x higher than baseline ({load_avg})"
+            })
+            severity_score += 3
+
+    # Check CPU-Memory correlation
+    if current["cpu_percent"] > 70 and current["memory"]["used_percent"] > 70:
+        anomalies.append({
+            "type": "RESOURCE_PRESSURE",
+            "severity": "HIGH",
+            "message": "Both CPU (>70%) and Memory (>70%) are under heavy load simultaneously"
+        })
+        severity_score += 2
+
+    return {
+        "anomalies_detected": len(anomalies),
+        "severity_score": severity_score,
+        "overall_health": "CRITICAL" if severity_score >= 8 else "WARNING" if severity_score >= 5 else "HEALTHY",
+        "anomalies": anomalies,
+        "timestamp": datetime.now().isoformat(),
+    }
+
+
+# ============================================================================
+# FEATURE 3: DEEP DEBUGGING
+# ============================================================================
+
+@tool
+def debug_issue(problem: str) -> str:
+    """
+    Deep debugging: Analyze system state to find root cause.
+
+    Examples:
+    - "Why is postgres slow?"
+    - "Database is crashing"
+    - "High CPU usage"
+    - "Memory keeps growing"
+    """
+    _debug(f"Deep debugging: {problem}")
+
+    # Gather comprehensive data
+    current_metrics = get_node_metrics()
+    postgres_health = get_postgres_health()
+    postgres_conns = get_postgres_connections()
+    anomalies = detect_anomalies()
+    cpu_trends = get_metric_trends("cpu", hours=2)
+    mem_trends = get_metric_trends("memory", hours=2)
+
+    analysis = []
+
+    # ROOT CAUSE ANALYSIS
+    analysis.append("🔍 ROOT CAUSE ANALYSIS\n")
+
+    # Pattern 1: High CPU + High connections = overload
+    if current_metrics["cpu_percent"] > 70 and postgres_conns.get("total_connections", 0) > 100:
+        analysis.append(f"🚨 DATABASE OVERLOAD: High CPU ({current_metrics['cpu_percent']}%) + High connections ({postgres_conns['total_connections']})")
+        analysis.append("   → Consider killing idle connections or optimizing slow queries\n")
+
+    # Pattern 2: Memory spike
+    if mem_trends.get("trend") == "📈 Increasing":
+        analysis.append(f"💾 MEMORY LEAK DETECTED: Memory increasing at {mem_trends.get('rate_of_change_percent')}%/hour")
+        analysis.append("   → Check for unbounded caches or query result sets\n")
+
+    # Pattern 3: PostgreSQL offline
+    if postgres_health.get("postgres_status") == "OFFLINE":
+        analysis.append("❌ POSTGRESQL DOWN: Connection refused on port 5432")
+        analysis.append("   → Restart PostgreSQL service or check firewall rules\n")
+
+    # Pattern 4: Disk full
+    if current_metrics["disk"]["used_percent"] > 90:
+        analysis.append(f"💿 DISK CRITICAL: {current_metrics['disk']['used_percent']}% full")
+        analysis.append("   → Clean up logs/temp files or add storage\n")
+
+    # Pattern 5: Load increasing
+    if cpu_trends.get("trend") == "📈 Increasing":
+        analysis.append(f"📊 TREND: CPU load increasing ({cpu_trends.get('rate_of_change_percent')}% over time)")
+        analysis.append("   → Check for new workloads or resource competition\n")
+
+    # RECOMMENDATIONS
+    analysis.append("\n💡 RECOMMENDATIONS:\n")
+
+    if anomalies.get("severity_score", 0) >= 8:
+        analysis.append("1. URGENT: Execute incident response plan")
+        analysis.append("2. Notify on-call team immediately")
+        analysis.append("3. Start collecting diagnostics (logs, traces)")
+    elif anomalies.get("severity_score", 0) >= 5:
+        analysis.append("1. Monitor the situation closely")
+        analysis.append("2. Start investigating root cause")
+        analysis.append("3. Prepare for potential mitigation")
+    else:
+        analysis.append("1. System appears healthy overall")
+        analysis.append("2. Continue normal monitoring")
+        analysis.append("3. Address any minor anomalies")
+
+    return "\n".join(analysis)
+
+
+# ============================================================================
+# GET TOOLS LIST
+# ============================================================================
+
+def get_tools() -> list:
+    """Return the list of tools available to the agent."""
+    return [
+        # Core monitoring
+        get_node_metrics,
+        get_postgres_health,
+        get_postgres_connections,
+        check_endpoint,
+        # Advanced features
+        get_metric_trends,
+        detect_anomalies,
+        debug_issue,
+    ]
+
+
 if __name__ == "__main__":
-    result = get_postgres_connections()
-    print("get_postgres_connections() returned:")
+    print("Testing anomaly detection...")
+    result = detect_anomalies()
+    print(result)
+
+    print("\nTesting metric trends...")
+    result = get_metric_trends("cpu", hours=2)
+    print(result)
+
+    print("\nTesting deep debugging...")
+    result = debug_issue("Why is the system slow?")
     print(result)
