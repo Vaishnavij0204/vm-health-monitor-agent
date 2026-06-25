@@ -94,14 +94,7 @@ Agent: No anomalies detected. Overall health is HEALTHY.
 
 🔌 Configuration
 
-.env variables needed:
-MODEL_SERVER_URL=https://m-serv1.relusys.lan/v1
-MODEL_SERVER_TOKEN=your_token
-MODEL_NAME=qwen3.6:27b
-PROMETHEUS_URL=http://192.168.0.117:9090
-LOKI_URL=http://192.168.0.117:3100
-VM_INSTANCE=192.168.0.162:9187
-DEBUG_TOOLS=true
+
 
 💡 Key Points
 
