@@ -30,9 +30,8 @@ def get_llm():
     """Initialize LLM with tool-calling support."""
     base_url = os.getenv("MODEL_SERVER_URL")
     api_key = os.getenv("MODEL_SERVER_TOKEN", "dummy-token")
-    model_name = os.getenv("MODEL_NAME", "qwen3:14b")
+    model_name = os.getenv("MODEL_NAME", "qwen3.6:27b")
     verify_ssl = os.getenv("MODEL_SERVER_VERIFY_SSL", "true").lower() == "true"
-    
 
     if not base_url:
         raise ValueError("MODEL_SERVER_URL must be configured in environment")
@@ -63,7 +62,6 @@ def query_prometheus(query: str, start: int = None, end: int = None, step: str =
     _debug(f"Querying Prometheus: {query[:50]}...")
     try:
         with httpx.Client(verify=False) as client:
-            # Range query if start/end provided, otherwise instant query
             if start and end:
                 response = client.get(
                     f"{PROMETHEUS_URL}/api/v1/query_range",
@@ -143,12 +141,11 @@ def parse_prometheus_metrics(metrics_text: str, metric_names: list = None) -> di
 
 
 # ============================================================================
-# CORE MONITORING TOOLS
+# CORE MONITORING TOOLS - INTERNAL IMPLEMENTATIONS
 # ============================================================================
 
-@tool
-def get_node_metrics() -> dict:
-    """Fetch comprehensive system metrics: CPU, memory, disk, load, network."""
+def _get_node_metrics_impl() -> dict:
+    """Internal: Fetch comprehensive system metrics."""
     _debug("Fetching node metrics from Prometheus")
 
     queries = {
@@ -200,8 +197,13 @@ def get_node_metrics() -> dict:
 
 
 @tool
-def get_postgres_health() -> dict:
-    """Check if PostgreSQL is running and accepting connections."""
+def get_node_metrics() -> dict:
+    """Fetch comprehensive system metrics: CPU, memory, disk, load, network."""
+    return _get_node_metrics_impl()
+
+
+def _get_postgres_health_impl() -> dict:
+    """Internal: Check PostgreSQL health."""
     _debug("Checking PostgreSQL health")
 
     try:
@@ -231,8 +233,13 @@ def get_postgres_health() -> dict:
 
 
 @tool
-def get_postgres_connections() -> dict:
-    """Get PostgreSQL connection metrics."""
+def get_postgres_health() -> dict:
+    """Check if PostgreSQL is running and accepting connections."""
+    return _get_postgres_health_impl()
+
+
+def _get_postgres_connections_impl() -> dict:
+    """Internal: Get PostgreSQL connection metrics."""
     _debug("Fetching PostgreSQL connection metrics")
 
     try:
@@ -268,6 +275,12 @@ def get_postgres_connections() -> dict:
 
 
 @tool
+def get_postgres_connections() -> dict:
+    """Get PostgreSQL connection metrics."""
+    return _get_postgres_connections_impl()
+
+
+@tool
 def check_endpoint(url: str) -> dict:
     """Check if a service endpoint is reachable."""
     _debug(f"Checking endpoint: {url}")
@@ -295,16 +308,8 @@ def check_endpoint(url: str) -> dict:
 # FEATURE 1: HISTORICAL TRENDS
 # ============================================================================
 
-@tool
-def get_metric_trends(metric: str = "cpu", hours: int = 1) -> dict:
-    """
-    Analyze historical trends for a metric over the past N hours.
-
-    Metrics: cpu, memory, disk, load
-    Hours: 1-24
-
-    Returns: min, max, avg, current, trend direction, rate of change
-    """
+def _get_metric_trends_impl(metric: str = "cpu", hours: int = 1) -> dict:
+    """Internal: Analyze historical trends."""
     _debug(f"Analyzing {metric} trends for past {hours} hours")
 
     if hours < 1 or hours > 24:
@@ -313,7 +318,6 @@ def get_metric_trends(metric: str = "cpu", hours: int = 1) -> dict:
     now = int(time.time())
     start = now - (hours * 3600)
 
-    # Select query based on metric
     metric_queries = {
         "cpu": '100 - (avg(rate(node_cpu_seconds_total{mode="idle",job="node-postgres-1"}[1m])) * 100)',
         "memory": '(1 - (node_memory_MemAvailable_bytes{job="node-postgres-1"} / node_memory_MemTotal_bytes{job="node-postgres-1"})) * 100',
@@ -330,7 +334,6 @@ def get_metric_trends(metric: str = "cpu", hours: int = 1) -> dict:
     if "error" in result or "result" not in result:
         return {"error": "Failed to fetch historical data"}
 
-    # Extract values
     series = result.get("result", [])
     if not series or not series[0].get("values"):
         return {"error": "No historical data available"}
@@ -340,13 +343,11 @@ def get_metric_trends(metric: str = "cpu", hours: int = 1) -> dict:
     if not values:
         return {"error": "No valid data points"}
 
-    # Calculate statistics
     min_val = min(values)
     max_val = max(values)
     avg_val = sum(values) / len(values)
     current_val = values[-1]
 
-    # Determine trend
     if len(values) > 1:
         first_half_avg = sum(values[:len(values)//2]) / (len(values)//2)
         second_half_avg = sum(values[len(values)//2:]) / (len(values) - len(values)//2)
@@ -369,41 +370,34 @@ def get_metric_trends(metric: str = "cpu", hours: int = 1) -> dict:
     }
 
 
+@tool
+def get_metric_trends(metric: str = "cpu", hours: int = 1) -> dict:
+    """Analyze historical trends for a metric over the past N hours. Metrics: cpu, memory, disk, load"""
+    return _get_metric_trends_impl(metric, hours)
+
+
 # ============================================================================
 # FEATURE 2: SMART ANOMALY DETECTION
 # ============================================================================
 
-@tool
-def detect_anomalies() -> dict:
-    """
-    Detect unusual patterns in system metrics.
-
-    Uses statistical analysis to find:
-    - Sudden spikes or drops
-    - Abnormal values compared to baseline
-    - Unusual correlations between metrics
-    """
+def _detect_anomalies_impl() -> dict:
+    """Internal: Detect unusual patterns."""
     _debug("Running anomaly detection")
 
-    # Get current metrics
-    current = get_node_metrics()
-
-    # Get historical baseline (last 6 hours)
-    cpu_trend = get_metric_trends("cpu", hours=6)
-    mem_trend = get_metric_trends("memory", hours=6)
-    disk_trend = get_metric_trends("disk", hours=6)
-    load_trend = get_metric_trends("load", hours=6)
+    current = _get_node_metrics_impl()
+    cpu_trend = _get_metric_trends_impl("cpu", hours=6)
+    mem_trend = _get_metric_trends_impl("memory", hours=6)
+    disk_trend = _get_metric_trends_impl("disk", hours=6)
+    load_trend = _get_metric_trends_impl("load", hours=6)
 
     anomalies = []
     severity_score = 0
 
-    # Check CPU anomalies
     if not cpu_trend.get("error"):
         cpu_current = current["cpu_percent"]
         cpu_avg = cpu_trend.get("avg_value", 0)
-        cpu_max = cpu_trend.get("max_value", 0)
 
-        if cpu_current > cpu_avg + (cpu_avg * 0.5):  # 50% above average
+        if cpu_current > cpu_avg + (cpu_avg * 0.5):
             anomalies.append({
                 "type": "CPU_SPIKE",
                 "severity": "HIGH" if cpu_current > 80 else "MEDIUM",
@@ -413,12 +407,11 @@ def detect_anomalies() -> dict:
             })
             severity_score += 3 if cpu_current > 80 else 2
 
-    # Check memory anomalies
     if not mem_trend.get("error"):
         mem_current = current["memory"]["used_percent"]
         mem_avg = mem_trend.get("avg_value", 0)
 
-        if mem_current > mem_avg + (mem_avg * 0.3):  # 30% above average
+        if mem_current > mem_avg + (mem_avg * 0.3):
             anomalies.append({
                 "type": "MEMORY_SPIKE",
                 "severity": "HIGH" if mem_current > 85 else "MEDIUM",
@@ -428,10 +421,8 @@ def detect_anomalies() -> dict:
             })
             severity_score += 3 if mem_current > 85 else 2
 
-    # Check disk anomalies
     if not disk_trend.get("error"):
         disk_current = current["disk"]["used_percent"]
-        disk_max = disk_trend.get("max_value", 0)
 
         if disk_current > 90:
             anomalies.append({
@@ -442,12 +433,11 @@ def detect_anomalies() -> dict:
             })
             severity_score += 5
 
-    # Check load anomalies
     if not load_trend.get("error"):
         load_current = current["load"]["1min"]
         load_avg = load_trend.get("avg_value", 0)
 
-        if load_current > load_avg * 2:  # 2x the average
+        if load_current > load_avg * 2:
             anomalies.append({
                 "type": "LOAD_SPIKE",
                 "severity": "HIGH",
@@ -457,7 +447,6 @@ def detect_anomalies() -> dict:
             })
             severity_score += 3
 
-    # Check CPU-Memory correlation
     if current["cpu_percent"] > 70 and current["memory"]["used_percent"] > 70:
         anomalies.append({
             "type": "RESOURCE_PRESSURE",
@@ -475,62 +464,50 @@ def detect_anomalies() -> dict:
     }
 
 
+@tool
+def detect_anomalies() -> dict:
+    """Detect unusual patterns in system metrics using statistical analysis."""
+    return _detect_anomalies_impl()
+
+
 # ============================================================================
 # FEATURE 3: DEEP DEBUGGING
 # ============================================================================
 
-@tool
-def debug_issue(problem: str) -> str:
-    """
-    Deep debugging: Analyze system state to find root cause.
-
-    Examples:
-    - "Why is postgres slow?"
-    - "Database is crashing"
-    - "High CPU usage"
-    - "Memory keeps growing"
-    """
+def _debug_issue_impl(problem: str) -> str:
+    """Internal: Deep debugging analysis."""
     _debug(f"Deep debugging: {problem}")
 
-    # Gather comprehensive data
-    current_metrics = get_node_metrics()
-    postgres_health = get_postgres_health()
-    postgres_conns = get_postgres_connections()
-    anomalies = detect_anomalies()
-    cpu_trends = get_metric_trends("cpu", hours=2)
-    mem_trends = get_metric_trends("memory", hours=2)
+    current_metrics = _get_node_metrics_impl()
+    postgres_health = _get_postgres_health_impl()
+    postgres_conns = _get_postgres_connections_impl()
+    anomalies = _detect_anomalies_impl()
+    cpu_trends = _get_metric_trends_impl("cpu", hours=2)
+    mem_trends = _get_metric_trends_impl("memory", hours=2)
 
     analysis = []
-
-    # ROOT CAUSE ANALYSIS
     analysis.append("🔍 ROOT CAUSE ANALYSIS\n")
 
-    # Pattern 1: High CPU + High connections = overload
     if current_metrics["cpu_percent"] > 70 and postgres_conns.get("total_connections", 0) > 100:
         analysis.append(f"🚨 DATABASE OVERLOAD: High CPU ({current_metrics['cpu_percent']}%) + High connections ({postgres_conns['total_connections']})")
         analysis.append("   → Consider killing idle connections or optimizing slow queries\n")
 
-    # Pattern 2: Memory spike
     if mem_trends.get("trend") == "📈 Increasing":
         analysis.append(f"💾 MEMORY LEAK DETECTED: Memory increasing at {mem_trends.get('rate_of_change_percent')}%/hour")
         analysis.append("   → Check for unbounded caches or query result sets\n")
 
-    # Pattern 3: PostgreSQL offline
     if postgres_health.get("postgres_status") == "OFFLINE":
         analysis.append("❌ POSTGRESQL DOWN: Connection refused on port 5432")
         analysis.append("   → Restart PostgreSQL service or check firewall rules\n")
 
-    # Pattern 4: Disk full
     if current_metrics["disk"]["used_percent"] > 90:
         analysis.append(f"💿 DISK CRITICAL: {current_metrics['disk']['used_percent']}% full")
         analysis.append("   → Clean up logs/temp files or add storage\n")
 
-    # Pattern 5: Load increasing
     if cpu_trends.get("trend") == "📈 Increasing":
         analysis.append(f"📊 TREND: CPU load increasing ({cpu_trends.get('rate_of_change_percent')}% over time)")
         analysis.append("   → Check for new workloads or resource competition\n")
 
-    # RECOMMENDATIONS
     analysis.append("\n💡 RECOMMENDATIONS:\n")
 
     if anomalies.get("severity_score", 0) >= 8:
@@ -549,6 +526,12 @@ def debug_issue(problem: str) -> str:
     return "\n".join(analysis)
 
 
+@tool
+def debug_issue(problem: str) -> str:
+    """Deep debugging: Analyze system state to find root cause. Examples: 'Why is postgres slow?', 'Database is crashing'"""
+    return _debug_issue_impl(problem)
+
+
 # ============================================================================
 # GET TOOLS LIST
 # ============================================================================
@@ -556,12 +539,10 @@ def debug_issue(problem: str) -> str:
 def get_tools() -> list:
     """Return the list of tools available to the agent."""
     return [
-        # Core monitoring
         get_node_metrics,
         get_postgres_health,
         get_postgres_connections,
         check_endpoint,
-        # Advanced features
         get_metric_trends,
         detect_anomalies,
         debug_issue,
@@ -570,13 +551,14 @@ def get_tools() -> list:
 
 if __name__ == "__main__":
     print("Testing anomaly detection...")
-    result = detect_anomalies()
+    result = _detect_anomalies_impl()
     print(result)
 
     print("\nTesting metric trends...")
-    result = get_metric_trends("cpu", hours=2)
+    result = _get_metric_trends_impl("cpu", hours=2)
     print(result)
 
     print("\nTesting deep debugging...")
-    result = debug_issue("Why is the system slow?")
+    result = _debug_issue_impl("Why is the system slow?")
     print(result)
+

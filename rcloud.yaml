@@ -4,7 +4,7 @@ framework: langgraph
 
 llm:
   provider: relusys
-  model: qwen3:8b
+  model: qwen3.6:27b
 
 deploy:
   env: staging
